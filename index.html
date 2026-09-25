@@ -256,7 +256,7 @@ header{padding:18px 0 16px}header h1{font-size:clamp(34px,3.5vw,54px)}header .su
 #board .tail .primary{font-size:calc(32px * var(--scale));font-weight:600}
 #board .tail .xcol{font-size:calc(18px * var(--scale))}
 #board .trow .tname{font-size:calc(28px * var(--scale))}
-#board .trow .rank{font-size:calc(30px * var(--scale))}
+#board .trow .rank{font-size:calc(30px * var(--scale));width:auto;min-width:calc(46px * var(--scale));white-space:nowrap}
 #board .trow .chip{font-size:calc(14px * var(--scale));font-weight:600}
 #board .trow{border-bottom:1px solid #b8c0ac}
 #board .tail,#board .axis .tailh{gap:20px}
@@ -420,10 +420,11 @@ const Tally = (function () {
     const judgeMean = {};
     judges.forEach(j => { judgeMean[j.id] = mean(teams.map(t => get(t, j))); });
 
-    /* --- Borda. Strict ordering: no shared places.
-       Within one judge, equal scores are separated by the panel's own raw total
-       for those teams (the team the whole panel rated higher goes ahead), then by
-       list order. Deterministic, and defensible in one sentence at 5:20 PM. --- */
+    /* --- Borda. Within one judge, equal scores are separated by the panel's own raw
+       total for those teams (the team the whole panel rated higher goes ahead).
+       If the panel totals are equal too, nothing separates them on merit, so they
+       split the points of the places they occupy. Presentation (list) order never
+       decides anything. --- */
     const borda = {}, sharedBorda = {}, placeCount = {}, tieBreaks = [], tieDecided = {};
     teams.forEach(t => {
       borda[t.id] = 0; sharedBorda[t.id] = 0; tieDecided[t.id] = 0;
@@ -434,13 +435,19 @@ const Tally = (function () {
       const order = teams.map((t, i) => ({ t, i, s: get(t, j) }));
       order.sort((a, b) =>
         (b.s - a.s) || (panelTotal[b.t.id] - panelTotal[a.t.id]) || (a.i - b.i));
-      order.forEach((o, idx) => {
-        borda[o.t.id] += T - idx;
-        placeCount[o.t.id][idx] += 1;
-      });
+      order.forEach((o, idx) => { placeCount[o.t.id][idx] += 1; });
+      for (let a = 0; a < T; ) {
+        let b = a;
+        while (b + 1 < T && order[b + 1].s === order[a].s &&
+               panelTotal[order[b + 1].t.id] === panelTotal[order[a].t.id]) b++;
+        let pts = 0;
+        for (let p = a; p <= b; p++) pts += T - p;
+        for (let p = a; p <= b; p++) borda[order[p].t.id] += pts / (b - a + 1);
+        a = b + 1;
+      }
       for (let k = 0; k < order.length - 1; k++) {
         if (order[k].s === order[k + 1].s) {
-          tieBreaks.push({ judge: j, ahead: order[k].t, behind: order[k + 1].t, score: order[k].s, reason: panelTotal[order[k].t.id] === panelTotal[order[k + 1].t.id] ? "list-order" : "panel-total", aheadTotal: panelTotal[order[k].t.id], behindTotal: panelTotal[order[k + 1].t.id] });
+          tieBreaks.push({ judge: j, ahead: order[k].t, behind: order[k + 1].t, score: order[k].s, reason: panelTotal[order[k].t.id] === panelTotal[order[k + 1].t.id] ? "shared" : "panel-total", aheadTotal: panelTotal[order[k].t.id], behindTotal: panelTotal[order[k + 1].t.id] });
         }
       }
       /* Same ordering, but teams this judge scored equally split the points of the
@@ -510,8 +517,14 @@ const Tally = (function () {
       };
     });
 
-    rows.sort((a, b) => (b.borda - a.borda) || (b.panelTotal - a.panelTotal) || (a.index - b.index));
-    rows.forEach((r, i) => { r.rank = i + 1; });
+    /* Teams level on both Borda points and panel total share a place (shown "T2").
+       Within a tie they are listed alphabetically, which carries no meaning. */
+    rows.sort((a, b) => (b.borda - a.borda) || (b.panelTotal - a.panelTotal) ||
+                        a.team.name.localeCompare(b.team.name));
+    rows.forEach(r => {
+      r.rank = 1 + rows.filter(o => o.borda > r.borda || (o.borda === r.borda && o.panelTotal > r.panelTotal)).length;
+    });
+    rows.forEach(r => { r.tied = rows.some(o => o !== r && o.rank === r.rank); });
 
     const byMean = rows.slice().sort((a, b) => (b.mean - a.mean) || (b.panelTotal - a.panelTotal));
     const meanDisagrees = byMean.some((r, i) => r.rank !== i + 1);
@@ -567,10 +580,14 @@ function runSelfTests() {
   const flat = mk([[7,7,7,7,7,7],[7,7,7,7,7,7],[7,7,7,7,7,7],[7,7,7,7,7,7],[7,7,7,7,7,7]], 3);
   ok("a panel that separated nothing gives every team the same shared total",
      new Set(flat.teams.map(x => x.sharedBorda)).size === 1);
-  ok("a panel that separated nothing still shows a strict spread",
-     Math.max.apply(null, flat.teams.map(x => x.borda)) !==
-     Math.min.apply(null, flat.teams.map(x => x.borda)));
-  ok("equal panel totals disclose Setup order fallback", flat.tieBreaks.length > 0 && flat.tieBreaks.every(t => t.reason === "list-order" && t.aheadTotal === t.behindTotal));
+  ok("a panel that separated nothing ties every team at rank 1",
+     flat.teams.every(x => x.rank === 1 && x.tied) && flat.bordaCheck);
+  ok("equal panel totals split points instead of using list order", flat.tieBreaks.length > 0 && flat.tieBreaks.every(t => t.reason === "shared" && t.aheadTotal === t.behindTotal));
+  /* Swapping two identical teams in the list must not change who is ahead. */
+  const sw1 = mk([[8,6],[6,8],[5,5]], 3), sw2 = mk([[6,8],[8,6],[5,5]], 3);
+  ok("list order never decides a place",
+     sw1.teams.filter(x => x.rank === 1).length === 2 && sw2.teams.filter(x => x.rank === 1).length === 2);
+  ok("a clear winner is not marked tied", r.teams[0].rank === 1 && !r.teams[0].tied);
   const unequal = mk([[8,9],[8,7]], 3);
   ok("unequal panel totals disclose higher-total tie-break", unequal.tieBreaks.length === 1 && unequal.tieBreaks[0].reason === "panel-total" && unequal.tieBreaks[0].aheadTotal === 17 && unequal.tieBreaks[0].behindTotal === 15);
   return out;
@@ -936,7 +953,8 @@ function renderBoard(result) {
     row.onclick = () => openDetail(r, result);
 
     const lab = el("div", "label", "");
-    lab.appendChild(el("span", "rank", String(r.rank)));
+    lab.appendChild(el("span", "rank", (r.tied ? "T" : "") + r.rank));
+    if (r.tied) lab.lastChild.title = "Tied: same Borda points and same panel total";
     const tname = el("span", "tname", "");
     tname.appendChild(teamIdentity(r.team.name));
     lab.appendChild(tname);
@@ -1018,7 +1036,7 @@ function openDetail(r, result) {
   const sheet = el("div", "sheet", "");
   const head = el("div", "shead", "");
   head.innerHTML = '<h2></h2>' +
-    '<span class="meta">Total ' + r.panelTotal + ' · Rank ' + r.rank + ' of ' + result.teams.length + '</span>' +
+    '<span class="meta">Total ' + r.panelTotal + ' · Rank ' + (r.tied ? 'tied ' : '') + r.rank + ' of ' + result.teams.length + '</span>' +
     '<span class="chip ' + (r.flag === "red" ? "red" : "green") + '">range ' + r.range + '</span>';
   head.querySelector("h2").appendChild(teamIdentity(r.team.name));
   const cl = el("button", "btn close", "Close"); cl.onclick = () => host.innerHTML = "";
@@ -1079,7 +1097,7 @@ function openDetail(r, result) {
     b3.innerHTML = '<h3>Ties that had to be broken</h3>';
     b3.appendChild(el("div", "note",
       tbs.map(t => t.judge.name + " scored " + t.ahead.name + " and " + t.behind.name + " both " + t.score +
-        " — " + t.ahead.name + (t.reason === "panel-total" ? " was placed ahead by the higher panel total (" + t.aheadTotal + " vs " + t.behindTotal + ")." : " was placed ahead by the team order in Setup. Both panel totals are " + t.aheadTotal + "; this ordering does not indicate a score advantage.")).join(" ")));
+        " — " + t.ahead.name + (t.reason === "panel-total" ? " was placed ahead by the higher panel total (" + t.aheadTotal + " vs " + t.behindTotal + ")." : " and " + t.behind.name + " split the points for those places, because their panel totals are also equal (" + t.aheadTotal + ").")).join(" ")));
     body.appendChild(b3);
   }
 
