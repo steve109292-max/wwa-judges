@@ -301,7 +301,6 @@ header{padding:18px 0 16px}header h1{font-size:clamp(34px,3.5vw,54px)}header .su
   <span class="spacer"></span>
   <span class="stopwatch" id="sw"></span>
   <span class="sync-status" id="syncStatus" role="status" aria-live="polite"></span>
-  <button class="btn" id="btnEditor">Editor sign-in</button>
   <button class="btn" id="btnSetup">Setup</button>
   <button class="btn" id="btnInput">Scores</button>
 </header>
@@ -348,7 +347,7 @@ header{padding:18px 0 16px}header h1{font-size:clamp(34px,3.5vw,54px)}header .su
               <button class="btn" id="clearAll">Clear all scores</button>
               <button class="btn" id="copyData">Copy scores as text</button>
             </div>
-            <div class="note">Saved online and shared with everyone who opens this link. Only a signed-in editor can change it.</div>
+            <div class="note">Saved online and shared with everyone who opens this link. Anyone with the link can enter scores.</div>
           </div>
           <div class="field private">
             <h3>Alternative ranking</h3>
@@ -1177,14 +1176,14 @@ document.addEventListener("keydown", e => {
 
 /* =========================================================================
    SHARED BOARD — one board for everyone who opens the link.
-   The server (Cloudflare Worker + D1) holds the authoritative copy. Anyone can read
-   it; writes need the editor PIN. Each browser also keeps its own copy, so a closed
+   The server (Cloudflare Worker + D1) holds the authoritative copy. Anyone who opens
+   the link can read and edit it. Each browser also keeps its own copy, so a closed
    tab or a dropped connection loses nothing: unsent edits upload when it's back.
    Only the shared fields travel; screen size and panel choices stay per-browser.
    ========================================================================= */
 var Sync = (() => {
   const API = "https://wwa-judges-api.wwa-judges-api.workers.dev";
-  const META_KEY = "wwa-sync-meta-v1", PIN_KEY = "wwa-editor-pin";
+  const META_KEY = "wwa-sync-meta-v1", OLD_PIN_KEY = "wwa-editor-pin";
   const SHARED = ["teams", "judges", "scores", "prize", "threshold"];
   const POLL_MS = 5000;   // free Cloudflare tier: 100k requests/day; hidden tabs stop polling
   const store = {
@@ -1193,19 +1192,19 @@ var Sync = (() => {
   };
   let meta = (() => { try { return JSON.parse(store.get(META_KEY)) || null; } catch (e) { return null; } })()
              || { version: 0, synced: null };      // synced = shared snapshot at last agreement with the server
-  let pin = store.get(PIN_KEY);
+  store.set(OLD_PIN_KEY, null);   // editing needs no PIN now; drop one an earlier sign-in left behind
   let uploadTimer = null, inFlight = false, again = false, lastOk = null, online = true;
 
   const shared = st => JSON.stringify(SHARED.reduce((o, k) => (o[k] = st[k], o), {}));
   const saveMeta = () => store.set(META_KEY, JSON.stringify(meta));
-  const dirty = () => pin && meta.synced !== shared(state);
+  const dirty = () => meta.synced !== shared(state);
 
   function status(cls, text) { const e = $("#syncStatus"); if (e) { e.className = "sync-status " + cls; e.textContent = text; } }
   function showStatus() {
     const t = lastOk ? " · " + lastOk.toLocaleTimeString([], { hour: "numeric", minute: "2-digit", second: "2-digit" }) : "";
     if (!online) return status("err", "Offline — " + (dirty() ? "changes saved on this computer, will upload" : "showing last copy"));
     if (dirty() || inFlight) return status("busy", "Saving…");
-    status("ok", (pin ? "Editing · saved" : "View only · live") + t);
+    status("ok", "Saved · live" + t);
   }
 
   /* Adopt the server's copy while keeping this browser's own preferences. */
@@ -1237,12 +1236,12 @@ var Sync = (() => {
   }
 
   async function upload() {
-    if (!pin || inFlight) { again = true; return; }
+    if (inFlight) { again = true; return; }
     if (!dirty()) { showStatus(); return; }
     inFlight = true; again = false; showStatus();
     const body = shared(state);
     try {
-      const r = await fetch(API + "/board", { method: "PUT", headers: { "Content-Type": "application/json", "X-Editor-Pin": pin },
+      const r = await fetch(API + "/board", { method: "PUT", headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ baseVersion: meta.version, state: JSON.parse(body) }) });
       online = true;
       if (r.ok) { const d = await r.json(); meta = { version: d.version, synced: body }; saveMeta(); lastOk = new Date(); }
@@ -1251,8 +1250,7 @@ var Sync = (() => {
         const merged = mergeOnto(d.state);
         meta = { version: d.version, synced: JSON.stringify(SHARED.reduce((o, k) => (o[k] = d.state[k], o), {})) }; saveMeta();
         adopt(merged); again = true;
-      } else if (r.status === 401) { signOut("That editor PIN is no longer valid. Sign in again to keep editing."); }
-      else throw new Error("HTTP " + r.status);
+      } else throw new Error("HTTP " + r.status);
     } catch (e) { online = false; setTimeout(upload, 4000); }
     inFlight = false; showStatus();
     if (again) upload();
@@ -1264,7 +1262,7 @@ var Sync = (() => {
       const r = await fetch(API + "/board", { cache: "no-store" });
       if (!r.ok) throw new Error("HTTP " + r.status);
       const d = await r.json(); online = true;
-      if (d.version === 0 || !d.state) { if (pin) upload(); }            // empty server: the first editor seeds it
+      if (d.version === 0 || !d.state) { upload(); }                     // empty server: the first browser seeds it
       else if (d.version !== meta.version) {
         if (dirty()) { upload(); }                                       // our edits win cell-by-cell via 409 merge
         else if (!document.activeElement || !document.activeElement.closest("#matrix, #teamList, #judgeList")) {
@@ -1278,37 +1276,18 @@ var Sync = (() => {
   }
 
   function applyRole() {
-    const ro = !pin;
     document.querySelectorAll("#matrix input, #judgeList input, #teamList input, #judgeList .x, #teamList .x, #addJudge, #addTeam, #clearAll, #thresh, #prizeRadio input")
-      .forEach(e => { e.disabled = ro; });
-    const b = $("#btnEditor"); if (b) b.textContent = pin ? "Sign out" : "Editor sign-in";
-    const n = $("#inputPanel .note"); if (n) n.textContent = ro
-      ? "View only. Scores update here automatically. Sign in as editor to enter scores."
-      : "Enter scores from 1 to 10. Use Tab or Enter to move between cells. Every entry saves online.";
-  }
-
-  function signOut(msg) { pin = null; store.set(PIN_KEY, null); applyRole(); showStatus(); if (msg) alert(msg); }
-
-  async function signIn() {
-    if (pin) { if (confirm("Sign out of editing on this computer?")) signOut(); return; }
-    const p = prompt("Editor PIN");
-    if (!p) return;
-    try {
-      const r = await fetch(API + "/check-pin", { method: "POST", headers: { "X-Editor-Pin": p.trim() } });
-      if (r.status !== 204) { alert("That PIN isn't right."); return; }
-    } catch (e) { alert("Can't reach the shared board right now. Check the internet connection and try again."); return; }
-    pin = p.trim(); store.set(PIN_KEY, pin);
-    // Coming online as an editor: take the server's latest before editing, unless this browser has unsent edits.
-    meta.synced = meta.synced || shared(state); saveMeta();
-    applyRole(); await poll();
+      .forEach(e => { e.disabled = false; });
+    const n = $("#inputPanel .note"); if (n) n.textContent =
+      "Enter scores from 1 to 10. Use Tab or Enter to move between cells. Every entry saves online.";
   }
 
   return {
-    start() { $("#btnEditor").onclick = signIn; applyRole(); showStatus(); poll(); setInterval(poll, POLL_MS);
+    start() { applyRole(); showStatus(); poll(); setInterval(poll, POLL_MS);
               window.addEventListener("online", () => { online = true; poll(); });
               document.addEventListener("visibilitychange", () => { if (!document.hidden) poll(); }); },
-    onLocalChange() { if (!pin) return; clearTimeout(uploadTimer); uploadTimer = setTimeout(upload, 400); showStatus(); },
-    canEdit: () => !!pin,
+    onLocalChange() { clearTimeout(uploadTimer); uploadTimer = setTimeout(upload, 400); showStatus(); },
+    canEdit: () => true,
     applyRole
   };
 })();
