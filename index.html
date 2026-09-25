@@ -649,9 +649,9 @@ function teamIdentity(name) {
 
 // Presentation order confirmed by Jossy Lee, 2026-09-25.
 const FINALISTS = ["MEandMine", "Slingshot AI", "MedHaul", "Boston Children's Hospital", "Xandar Kardian"];
-// Alphabetical by last name; the position is the judge's card number.
-const DEFAULT_JUDGES = ["Craig Albert", "Andrea Baccarelli", "Rob Huckman",
-                        "Karim Lakhani", "Allison Scott", "Teresa Williamson"];
+// Alphabetical by first name, left to right; the position is the judge's card number.
+const DEFAULT_JUDGES = ["Allison Scott", "Andrea Baccarelli", "Craig Albert",
+                        "Karim Lakhani", "Rob Huckman", "Teresa Williamson"];
 const DEFAULT_TEAMS = FINALISTS.slice();
 
 let state = loadState() || freshState();
