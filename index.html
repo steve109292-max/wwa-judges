@@ -337,7 +337,6 @@ header{padding:18px 0 16px}header h1{font-size:clamp(34px,3.5vw,54px)}header .su
         <div>
           <div class="field"><label>Data</label>
             <div class="rowbtns">
-              <button class="btn" id="loadDemo">Reset demo scores</button>
               <button class="btn" id="clearAll">Clear all scores</button>
               <button class="btn" id="copyData">Copy scores as text</button>
             </div>
@@ -636,29 +635,7 @@ const DEFAULT_JUDGES = ["Craig Albert", "Teresa Williamson", "Rob Huckman",
                         "Karim Lakhani", "Allison Scott", "Andrea Baccarelli"];
 const DEFAULT_TEAMS = FINALISTS.slice();
 
-/* Rehearsal data: one runaway winner, one clear floor, one lone dissent,
-   one head-on collision, one quiet middle. Two red rows, as intended.
-   Teams are deliberately shuffled against the announcement order: these scores are fictional. */
-const DEMO = {
-  teams: ["MedHaul", "Xandar Kardian", "Ash by Slingshot AI", "MEandMine", "Boston Children's Hospital"],
-  scores: [
-    [9, 9, 10, 8, 9, 8],
-    [3, 8,  8, 7, 10, 8],
-    [9, 9,  4, 4, 9, 4],
-    [6, 7,  6, 5, 7, 6],
-    [4, 3,  3, 2, 4, 3]
-  ]
-};
-
-let state = loadState() || rehearsalState();
-
-function rehearsalState() {
-  const s = freshState();
-  s.teams = DEMO.teams.map((name, i) => ({ id: "t" + i, name }));
-  s.teams.forEach((t, ti) => s.judges.forEach((j, ji) => { s.scores[t.id][j.id] = DEMO.scores[ti][ji]; }));
-  s.demo = true;
-  return s;
-}
+let state = loadState() || freshState();
 
 function freshState() {
   const s = {
@@ -674,20 +651,13 @@ function loadState() { try { const r = localStorage.getItem(STORE_KEY); return r
 function saveState() { try { localStorage.setItem(STORE_KEY, JSON.stringify(state)); } catch (e) {} }
 
 function normalise() {
+  // Sample (demo) boards are retired: a browser still holding one starts on a blank board.
+  if (state.demo) { state = freshState(); }
   // Replace former placeholder team names by position; typed names are left alone.
-  // Old rehearsal names map onto the (shuffled) demo order, old blank-board names onto the finalists.
-  const oldDemoTeams = ["Team Alpha", "Team Beta", "Team Gamma", "Team Delta", "Team Echo"];
+  const placeholderTeams = ["Team Alpha", "Team Beta", "Team Gamma", "Team Delta", "Team Echo"];
   state.teams.forEach((t, i) => {
-    if (t.name === oldDemoTeams[i]) t.name = DEMO.teams[i];
-    else if (t.name === "Finalist " + (i + 1) && FINALISTS[i]) t.name = FINALISTS[i];
+    if ((t.name === placeholderTeams[i] || t.name === "Finalist " + (i + 1)) && FINALISTS[i]) t.name = FINALISTS[i];
   });
-
-  // Update only an untouched, explicitly marked legacy rehearsal dataset.
-  const legacyDemo = [[9,9,10,8,9,9],[3,8,8,8,10,8],[9,9,4,4,9,4],[6,7,6,5,7,6],[4,3,3,2,4,3]];
-  if (state.demo && state.teams.length === 5 && state.judges.length === 6 &&
-      state.teams.every((t,i) => t.name === DEMO.teams[i] && state.judges.every((j,k) => state.scores[t.id]?.[j.id] === legacyDemo[i][k]))) {
-    state.teams.forEach((t,i) => state.judges.forEach((j,k) => { state.scores[t.id][j.id] = DEMO.scores[i][k]; }));
-  }
 
   // Correct the former placeholder name while preserving the judge ID and scores.
   state.judges.forEach(j => { if (/\bwalensky\b/i.test(j.name)) j.name = "Craig Albert"; });
@@ -918,7 +888,6 @@ function renderBoard(result) {
 
   const bar = el("div", "boardbar", "");
   bar.appendChild(el("h2", "board-title", "Team rankings"));
-  if (state.demo) bar.appendChild(el("span", "demo-banner", "DEMO · SAMPLE SCORES"));
   bar.appendChild(el("span", "spacer", ""));
   host.appendChild(bar);
 
@@ -1143,17 +1112,6 @@ document.querySelectorAll('#prizeRadio label').forEach(l => {
 $("#thresh").oninput = e => { state.threshold = Math.max(1, Math.min(9, +e.target.value || 3)); render(); };
 $("#scale").oninput = e => { state.scale = +e.target.value; render(); };
 $("#showMean").onchange = e => { state.showMean = e.target.checked; render(); };
-$("#loadDemo").onclick = () => {
-  state.teams = DEMO.teams.map((n, i) => ({ id: "t" + i, name: n }));
-  if (state.judges.length !== 6) state.judges = DEFAULT_JUDGES.map((n, i) => ({ id: "j" + i, name: n }));
-  state.scores = {};
-  state.teams.forEach((t, ti) => {
-    state.scores[t.id] = {};
-    state.judges.forEach((j, ji) => state.scores[t.id][j.id] = DEMO.scores[ti][ji]);
-  });
-  state.demo = true; swStart = null; clearInterval(swTimer); $("#sw").textContent = "";
-  showPanel("none"); render();
-};
 $("#clearAll").onclick = () => {
   state.teams.forEach(t => state.judges.forEach(j => state.scores[t.id][j.id] = null));
   state.demo = false; swStart = null; clearInterval(swTimer); $("#sw").textContent = "";
