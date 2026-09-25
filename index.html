@@ -261,6 +261,12 @@ header{padding:18px 0 16px}header h1{font-size:clamp(34px,3.5vw,54px)}header .su
 #board .trow{border-bottom:1px solid #b8c0ac}
 #board .tail,#board .axis .tailh{gap:20px}
 #board .trow .tname{white-space:normal;overflow:visible;overflow-wrap:anywhere}
+/* Shared-board sync status */
+.sync-status{font-size:12px;color:var(--muted);white-space:nowrap;display:flex;align-items:center;gap:6px}
+.sync-status:before{content:"";width:8px;height:8px;border-radius:50%;background:var(--muted)}
+.sync-status.ok:before{background:#15803d}.sync-status.busy:before{background:#d97706}.sync-status.err:before{background:#b91c1c}
+.sync-status.err{color:#b91c1c}
+.matrix input:disabled{background:transparent;color:var(--ink);opacity:1;cursor:default}
 /* Finalist logos: the logo leads, the typed name stays underneath so it can still be read aloud. */
 .team-id{display:flex;flex-direction:column;align-items:flex-start;gap:4px;min-width:0}
 .team-id img{display:block;height:auto;width:auto;object-fit:contain}
@@ -294,6 +300,8 @@ header{padding:18px 0 16px}header h1{font-size:clamp(34px,3.5vw,54px)}header .su
   <span class="sub">Judge Deliberation</span>
   <span class="spacer"></span>
   <span class="stopwatch" id="sw"></span>
+  <span class="sync-status" id="syncStatus" role="status" aria-live="polite"></span>
+  <button class="btn" id="btnEditor">Editor sign-in</button>
   <button class="btn" id="btnSetup">Setup</button>
   <button class="btn" id="btnInput">Scores</button>
 </header>
@@ -340,7 +348,7 @@ header{padding:18px 0 16px}header h1{font-size:clamp(34px,3.5vw,54px)}header .su
               <button class="btn" id="clearAll">Clear all scores</button>
               <button class="btn" id="copyData">Copy scores as text</button>
             </div>
-            <div class="note">Stored in this browser only.</div>
+            <div class="note">Saved online and shared with everyone who opens this link. Only a signed-in editor can change it.</div>
           </div>
           <div class="field private">
             <h3>Alternative ranking</h3>
@@ -667,14 +675,22 @@ function freshState() {
   return s;
 }
 function loadState() { try { const r = localStorage.getItem(STORE_KEY); return r ? JSON.parse(r) : null; } catch (e) { return null; } }
-function saveState() { try { localStorage.setItem(STORE_KEY, JSON.stringify(state)); } catch (e) {} }
+function saveState() {
+  try { localStorage.setItem(STORE_KEY, JSON.stringify(state)); } catch (e) {}
+  if (typeof Sync !== "undefined") Sync.onLocalChange();
+}
 
 function normalise() {
   // Sample (demo) boards are retired: a browser still holding one starts on a blank board.
   if (state.demo) { state = freshState(); }
-  // A board with no scores yet adopts the current finalist and judge order.
+  // A board with no scores that still lists exactly the default teams and judges, only in an
+  // older order, adopts the current order. Renamed or added names are never touched.
   const anyScore = state.teams.some(t => state.judges.some(j => typeof state.scores[t.id]?.[j.id] === "number"));
-  if (!anyScore) {
+  const sameSet = (list, want) => list.length === want.length && want.every(n => list.includes(n));
+  const reorderedOnly = (list, want) => sameSet(list, want) && list.some((n, i) => n !== want[i]);
+  const teamNames = state.teams.map(t => t.name === "Ash by Slingshot AI" ? "Slingshot AI" : t.name), judgeNames = state.judges.map(j => j.name);
+  if (!anyScore && sameSet(teamNames, FINALISTS) && sameSet(judgeNames, DEFAULT_JUDGES) &&
+      (reorderedOnly(teamNames, FINALISTS) || reorderedOnly(judgeNames, DEFAULT_JUDGES))) {
     const keep = { prize: state.prize, threshold: state.threshold, scale: state.scale, showMean: state.showMean };
     state = Object.assign(freshState(), keep);
   }
@@ -710,6 +726,7 @@ function render() {
   renderSetup(result);
   renderMatrix();
   renderBoard(result);
+  if (Sync) Sync.applyRole();
 }
 
 /* ---------- setup ---------- */
@@ -1135,7 +1152,7 @@ $("#addTeam").onclick = () => {
   state.scores[id] = {}; state.judges.forEach(j => state.scores[id][j.id] = null); render();
 };
 document.querySelectorAll('#prizeRadio label').forEach(l => {
-  l.onclick = () => { state.prize = l.dataset.v; render(); };
+  l.onclick = () => { if (!Sync.canEdit()) return; state.prize = l.dataset.v; render(); };
 });
 $("#thresh").oninput = e => { state.threshold = Math.max(1, Math.min(9, +e.target.value || 3)); render(); };
 $("#scale").oninput = e => { state.scale = +e.target.value; render(); };
@@ -1158,6 +1175,144 @@ document.addEventListener("keydown", e => {
   if (e.key === "Escape") { $("#overlayHost").innerHTML = ""; }
 });
 
+/* =========================================================================
+   SHARED BOARD — one board for everyone who opens the link.
+   The server (Cloudflare Worker + D1) holds the authoritative copy. Anyone can read
+   it; writes need the editor PIN. Each browser also keeps its own copy, so a closed
+   tab or a dropped connection loses nothing: unsent edits upload when it's back.
+   Only the shared fields travel; screen size and panel choices stay per-browser.
+   ========================================================================= */
+var Sync = (() => {
+  const API = "https://wwa-judges-api.wwa-judges-api.workers.dev";
+  const META_KEY = "wwa-sync-meta-v1", PIN_KEY = "wwa-editor-pin";
+  const SHARED = ["teams", "judges", "scores", "prize", "threshold"];
+  const POLL_MS = 5000;   // free Cloudflare tier: 100k requests/day; hidden tabs stop polling
+  const store = {
+    get(k) { try { return localStorage.getItem(k); } catch (e) { return null; } },
+    set(k, v) { try { v === null ? localStorage.removeItem(k) : localStorage.setItem(k, v); } catch (e) {} }
+  };
+  let meta = (() => { try { return JSON.parse(store.get(META_KEY)) || null; } catch (e) { return null; } })()
+             || { version: 0, synced: null };      // synced = shared snapshot at last agreement with the server
+  let pin = store.get(PIN_KEY);
+  let uploadTimer = null, inFlight = false, again = false, lastOk = null, online = true;
+
+  const shared = st => JSON.stringify(SHARED.reduce((o, k) => (o[k] = st[k], o), {}));
+  const saveMeta = () => store.set(META_KEY, JSON.stringify(meta));
+  const dirty = () => pin && meta.synced !== shared(state);
+
+  function status(cls, text) { const e = $("#syncStatus"); if (e) { e.className = "sync-status " + cls; e.textContent = text; } }
+  function showStatus() {
+    const t = lastOk ? " · " + lastOk.toLocaleTimeString([], { hour: "numeric", minute: "2-digit", second: "2-digit" }) : "";
+    if (!online) return status("err", "Offline — " + (dirty() ? "changes saved on this computer, will upload" : "showing last copy"));
+    if (dirty() || inFlight) return status("busy", "Saving…");
+    status("ok", (pin ? "Editing · saved" : "View only · live") + t);
+  }
+
+  /* Adopt the server's copy while keeping this browser's own preferences. */
+  function adopt(serverState) {
+    SHARED.forEach(k => { if (serverState[k] !== undefined) state[k] = serverState[k]; });
+    state.demo = false;
+    try { localStorage.setItem(STORE_KEY, JSON.stringify(state)); } catch (e) {}
+    render(); applyRole();
+  }
+
+  /* Cell-level three-way merge: our edits since the last agreed snapshot, on top of theirs. */
+  function mergeOnto(serverState) {
+    const base = meta.synced ? JSON.parse(meta.synced) : { teams: [], judges: [], scores: {} };
+    const mine = JSON.parse(shared(state));
+    const out = JSON.parse(JSON.stringify(serverState));
+    ["prize", "threshold"].forEach(k => { if (mine[k] !== base[k]) out[k] = mine[k]; });
+    if (JSON.stringify(mine.teams) !== JSON.stringify(base.teams)) out.teams = mine.teams;
+    if (JSON.stringify(mine.judges) !== JSON.stringify(base.judges)) out.judges = mine.judges;
+    out.scores = out.scores || {};
+    out.teams.forEach(t => {
+      out.scores[t.id] = out.scores[t.id] || {};
+      out.judges.forEach(j => {
+        const b = base.scores?.[t.id]?.[j.id], m = mine.scores?.[t.id]?.[j.id];
+        if (m !== b && m !== undefined) out.scores[t.id][j.id] = m;
+        if (out.scores[t.id][j.id] === undefined) out.scores[t.id][j.id] = null;
+      });
+    });
+    return out;
+  }
+
+  async function upload() {
+    if (!pin || inFlight) { again = true; return; }
+    if (!dirty()) { showStatus(); return; }
+    inFlight = true; again = false; showStatus();
+    const body = shared(state);
+    try {
+      const r = await fetch(API + "/board", { method: "PUT", headers: { "Content-Type": "application/json", "X-Editor-Pin": pin },
+        body: JSON.stringify({ baseVersion: meta.version, state: JSON.parse(body) }) });
+      online = true;
+      if (r.ok) { const d = await r.json(); meta = { version: d.version, synced: body }; saveMeta(); lastOk = new Date(); }
+      else if (r.status === 409) {                // someone saved first: merge and try again
+        const d = await r.json();
+        const merged = mergeOnto(d.state);
+        meta = { version: d.version, synced: JSON.stringify(SHARED.reduce((o, k) => (o[k] = d.state[k], o), {})) }; saveMeta();
+        adopt(merged); again = true;
+      } else if (r.status === 401) { signOut("That editor PIN is no longer valid. Sign in again to keep editing."); }
+      else throw new Error("HTTP " + r.status);
+    } catch (e) { online = false; setTimeout(upload, 4000); }
+    inFlight = false; showStatus();
+    if (again) upload();
+  }
+
+  async function poll() {
+    if (document.hidden) return;
+    try {
+      const r = await fetch(API + "/board", { cache: "no-store" });
+      if (!r.ok) throw new Error("HTTP " + r.status);
+      const d = await r.json(); online = true;
+      if (d.version === 0 || !d.state) { if (pin) upload(); }            // empty server: the first editor seeds it
+      else if (d.version !== meta.version) {
+        if (dirty()) { upload(); }                                       // our edits win cell-by-cell via 409 merge
+        else if (!document.activeElement || !document.activeElement.closest("#matrix, #teamList, #judgeList")) {
+          meta = { version: d.version, synced: JSON.stringify(SHARED.reduce((o, k) => (o[k] = d.state[k], o), {})) }; saveMeta();
+          adopt(d.state);
+        }
+      } else if (dirty()) upload();
+      if (!lastOk && d.updated) lastOk = new Date(d.updated);
+    } catch (e) { online = false; }
+    showStatus();
+  }
+
+  function applyRole() {
+    const ro = !pin;
+    document.querySelectorAll("#matrix input, #judgeList input, #teamList input, #judgeList .x, #teamList .x, #addJudge, #addTeam, #clearAll, #thresh, #prizeRadio input")
+      .forEach(e => { e.disabled = ro; });
+    const b = $("#btnEditor"); if (b) b.textContent = pin ? "Sign out" : "Editor sign-in";
+    const n = $("#inputPanel .note"); if (n) n.textContent = ro
+      ? "View only. Scores update here automatically. Sign in as editor to enter scores."
+      : "Enter scores from 1 to 10. Use Tab or Enter to move between cells. Every entry saves online.";
+  }
+
+  function signOut(msg) { pin = null; store.set(PIN_KEY, null); applyRole(); showStatus(); if (msg) alert(msg); }
+
+  async function signIn() {
+    if (pin) { if (confirm("Sign out of editing on this computer?")) signOut(); return; }
+    const p = prompt("Editor PIN");
+    if (!p) return;
+    try {
+      const r = await fetch(API + "/check-pin", { method: "POST", headers: { "X-Editor-Pin": p.trim() } });
+      if (r.status !== 204) { alert("That PIN isn't right."); return; }
+    } catch (e) { alert("Can't reach the shared board right now. Check the internet connection and try again."); return; }
+    pin = p.trim(); store.set(PIN_KEY, pin);
+    // Coming online as an editor: take the server's latest before editing, unless this browser has unsent edits.
+    meta.synced = meta.synced || shared(state); saveMeta();
+    applyRole(); await poll();
+  }
+
+  return {
+    start() { $("#btnEditor").onclick = signIn; applyRole(); showStatus(); poll(); setInterval(poll, POLL_MS);
+              window.addEventListener("online", () => { online = true; poll(); });
+              document.addEventListener("visibilitychange", () => { if (!document.hidden) poll(); }); },
+    onLocalChange() { if (!pin) return; clearTimeout(uploadTimer); uploadTimer = setTimeout(upload, 400); showStatus(); },
+    canEdit: () => !!pin,
+    applyRole
+  };
+})();
+
 /* ---------- boot ---------- */
 const tests = runSelfTests();
 const failed = tests.filter(t => !t.pass);
@@ -1171,6 +1326,7 @@ render();
 if (!Tally.computeTally({teams:state.teams,judges:state.judges,scores:state.scores,redThreshold:state.threshold}).complete) {
   showPanel("input");
 }
+Sync.start();
 </script>
 </body>
 </html>
