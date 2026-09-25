@@ -630,9 +630,11 @@ function teamIdentity(name) {
   return wrap;
 }
 
-const FINALISTS = ["Boston Children's Hospital", "MEandMine", "MedHaul", "Ash by Slingshot AI", "Xandar Kardian"];
-const DEFAULT_JUDGES = ["Craig Albert", "Teresa Williamson", "Rob Huckman",
-                        "Karim Lakhani", "Allison Scott", "Andrea Baccarelli"];
+// Presentation order confirmed by Jossy Lee, 2026-09-25.
+const FINALISTS = ["MEandMine", "Slingshot AI", "MedHaul", "Boston Children's Hospital", "Xandar Kardian"];
+// Alphabetical by last name; the position is the judge's card number.
+const DEFAULT_JUDGES = ["Craig Albert", "Andrea Baccarelli", "Rob Huckman",
+                        "Karim Lakhani", "Allison Scott", "Teresa Williamson"];
 const DEFAULT_TEAMS = FINALISTS.slice();
 
 let state = loadState() || freshState();
@@ -653,6 +655,14 @@ function saveState() { try { localStorage.setItem(STORE_KEY, JSON.stringify(stat
 function normalise() {
   // Sample (demo) boards are retired: a browser still holding one starts on a blank board.
   if (state.demo) { state = freshState(); }
+  // A board with no scores yet adopts the current finalist and judge order.
+  const anyScore = state.teams.some(t => state.judges.some(j => typeof state.scores[t.id]?.[j.id] === "number"));
+  if (!anyScore) {
+    const keep = { prize: state.prize, threshold: state.threshold, scale: state.scale, showMean: state.showMean };
+    state = Object.assign(freshState(), keep);
+  }
+  // Earlier name for Slingshot AI's entry.
+  state.teams.forEach(t => { if (t.name === "Ash by Slingshot AI") t.name = "Slingshot AI"; });
   // Replace former placeholder team names by position; typed names are left alone.
   const placeholderTeams = ["Team Alpha", "Team Beta", "Team Gamma", "Team Delta", "Team Echo"];
   state.teams.forEach((t, i) => {
